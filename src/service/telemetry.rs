@@ -137,9 +137,10 @@ impl TelemetryService {
         let store_ref = self.account_store.clone();
         let account_id = account.id;
         let proxy_url = account.proxy_url.clone();
+        let gateway_url = account.gateway_url.clone();
 
         tokio::spawn(async move {
-            telemetry_loop(sessions_ref, store_ref, account_id, proxy_url).await;
+            telemetry_loop(sessions_ref, store_ref, account_id, proxy_url, gateway_url).await;
         });
     }
 }
@@ -153,8 +154,21 @@ async fn telemetry_loop(
     store: Arc<AccountStore>,
     account_id: i64,
     proxy_url: String,
+    gateway_url: String,
 ) {
     let client = crate::tlsfp::make_request_client(&proxy_url);
+    let use_gateway = !gateway_url.is_empty();
+    let gw_base = gateway_url.trim_end_matches('/');
+
+    // Build request URL + upstream URL for a given path.
+    let make_urls = |path: &str| -> (String, String) {
+        let upstream = format!("{}{}", UPSTREAM_BASE, path);
+        if use_gateway {
+            (format!("{}{}", gw_base, path), upstream)
+        } else {
+            (upstream.clone(), upstream)
+        }
+    };
 
     loop {
         tokio::time::sleep(TICK_INTERVAL).await;
@@ -189,9 +203,11 @@ async fn telemetry_loop(
             session.send_count += 1;
             drop(map);
 
+            let (req_url, upstream_url) = make_urls("/api/event_logging/batch");
             send_telemetry(
                 &c,
-                &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                &req_url,
+                if use_gateway { Some(upstream_url.as_str()) } else { None },
                 &token,
                 &payload,
                 &session_ua(&store, account_id).await,
@@ -215,9 +231,12 @@ async fn telemetry_loop(
             session.send_count += 1;
             drop(map);
 
+            let path = format!("/api/eval/{}", GROWTHBOOK_CLIENT_KEY);
+            let (req_url, upstream_url) = make_urls(&path);
             send_telemetry(
                 &c,
-                &format!("{}/api/eval/{}", UPSTREAM_BASE, GROWTHBOOK_CLIENT_KEY),
+                &req_url,
+                if use_gateway { Some(upstream_url.as_str()) } else { None },
                 &token,
                 &payload,
                 &session_ua(&store, account_id).await,
@@ -255,16 +274,21 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
 async fn send_telemetry(
     client: &reqwest::Client,
     url: &str,
+    proxy_target_url: Option<&str>,
     token: &str,
     body: &serde_json::Value,
     user_agent: &str,
 ) {
-    let result = client
+    let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
         .header("User-Agent", user_agent)
         .header("x-service-name", "claude-code")
-        .header("Authorization", format!("Bearer {}", token))
+        .header("Authorization", format!("Bearer {}", token));
+    if let Some(target) = proxy_target_url {
+        req = req.header("x-proxy-target-url", target);
+    }
+    let result = req
         .json(body)
         .send()
         .await;
