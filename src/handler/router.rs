@@ -169,6 +169,7 @@ struct CreateAccountRequest {
     refresh_token: Option<String>,
     expires_at: Option<i64>,
     proxy_url: Option<String>,
+    gateway_url: Option<String>,
     billing_mode: Option<String>,
     account_uuid: Option<String>,
     organization_uuid: Option<String>,
@@ -206,6 +207,7 @@ async fn create_account(
         oauth_refreshed_at: None,
         auth_error: String::new(),
         proxy_url: req.proxy_url.unwrap_or_default(),
+        gateway_url: req.gateway_url.unwrap_or_default(),
         device_id: String::new(),
         canonical_env: serde_json::json!({}),
         canonical_prompt: serde_json::json!({}),
@@ -282,6 +284,9 @@ async fn update_account(
     }
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
         existing.proxy_url = proxy_url.to_string();
+    }
+    if let Some(gateway_url) = updates.get("gateway_url").and_then(|v| v.as_str()) {
+        existing.gateway_url = gateway_url.to_string();
     }
     if let Some(concurrency) = updates.get("concurrency").and_then(|v| v.as_i64()) {
         if concurrency > 0 {
@@ -370,7 +375,7 @@ async fn test_account(
     };
     match state
         .token_tester
-        .test_token(&token, &account.proxy_url)
+        .test_token(&token, &account.proxy_url, &account.gateway_url)
         .await
     {
         Ok(()) => Ok(Json(serde_json::json!({"status": "ok"}))),

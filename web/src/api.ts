@@ -35,6 +35,7 @@ export interface Account {
   oauth_refreshed_at?: string
   auth_error?: string
   proxy_url: string
+  gateway_url: string
   device_id: string
   canonical_env?: Record<string, unknown>
   canonical_prompt_env?: Record<string, unknown>

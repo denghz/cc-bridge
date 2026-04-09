@@ -41,6 +41,7 @@ async fn create_test_account(svc: &AccountService, email: &str, priority: i32) -
         oauth_refreshed_at: None,
         auth_error: String::new(),
         proxy_url: String::new(),
+        gateway_url: String::new(),
         device_id: String::new(),
         canonical_env: serde_json::json!({}),
         canonical_prompt: serde_json::json!({}),

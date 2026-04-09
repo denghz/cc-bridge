@@ -172,7 +172,7 @@ impl AccountService {
             ));
         }
         let token = self.resolve_oauth_access_token(&account).await?;
-        let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url).await?;
+        let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url, &account.gateway_url).await?;
         let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(id, &usage_str).await?;
         Ok(usage)

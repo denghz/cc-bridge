@@ -93,6 +93,7 @@ impl AccountStore {
             oauth_refreshed_at: Self::parse_optional_time(row, "oauth_refreshed_at"),
             auth_error: row.try_get::<String, _>("auth_error").unwrap_or_default(),
             proxy_url: row.try_get::<String, _>("proxy_url").unwrap_or_default(),
+            gateway_url: row.try_get::<String, _>("gateway_url").unwrap_or_default(),
             device_id: row.try_get::<String, _>("device_id").unwrap_or_default(),
             canonical_env: Self::parse_json(row, "canonical_env"),
             canonical_prompt: Self::parse_json(row, "canonical_prompt_env"),
@@ -144,14 +145,14 @@ impl AccountStore {
 
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let q = format!(
-            r#"INSERT INTO accounts (name, email, status, token, proxy_url,
+            r#"INSERT INTO accounts (name, email, status, token, proxy_url, gateway_url,
                 auth_type, access_token, refresh_token, oauth_expires_at, oauth_refreshed_at, auth_error,
                 device_id, canonical_env, canonical_prompt_env, canonical_process,
                 billing_mode, account_uuid, organization_uuid, subscription_type,
                 concurrency, priority, auto_telemetry)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,{},{},{},$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,{},{},{},$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
             RETURNING id, created_at, updated_at"#,
-            self.ts(9), self.ts(10), "$11"
+            self.ts(10), self.ts(11), "$12"
         );
         let row: AnyRow = sqlx::query(&q)
         .bind(&a.name)
@@ -159,6 +160,7 @@ impl AccountStore {
         .bind(a.status.to_string())
         .bind(&a.setup_token)
         .bind(&a.proxy_url)
+        .bind(&a.gateway_url)
         .bind(a.auth_type.to_string())
         .bind(&a.access_token)
         .bind(&a.refresh_token)
@@ -192,10 +194,10 @@ impl AccountStore {
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
-                auth_error=$10, proxy_url=$11, billing_mode=$12,
-                account_uuid=$13, organization_uuid=$14, subscription_type=$15,
-                concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
-            WHERE id=$19"#,
+                auth_error=$10, proxy_url=$11, gateway_url=$12, billing_mode=$13,
+                account_uuid=$14, organization_uuid=$15, subscription_type=$16,
+                concurrency=$17, priority=$18, auto_telemetry=$19, updated_at={}
+            WHERE id=$20"#,
             self.ts(8), self.ts(9), self.now_expr()
         );
         sqlx::query(&q)
@@ -210,6 +212,7 @@ impl AccountStore {
             .bind(oauth_refreshed_at)
             .bind(&a.auth_error)
             .bind(&a.proxy_url)
+            .bind(&a.gateway_url)
             .bind(a.billing_mode.to_string())
             .bind(&a.account_uuid)
             .bind(&a.organization_uuid)
@@ -438,7 +441,7 @@ impl AccountStore {
 }
 
 const ACCOUNT_COLS: &str = r#"id, name, email, status, token, auth_type, access_token, refresh_token,
-    oauth_expires_at, oauth_refreshed_at, auth_error, proxy_url, device_id,
+    oauth_expires_at, oauth_refreshed_at, auth_error, proxy_url, gateway_url, device_id,
     canonical_env, canonical_prompt_env, canonical_process,
     billing_mode, account_uuid, organization_uuid, subscription_type,
     concurrency, priority, rate_limited_at, rate_limit_reset_at,

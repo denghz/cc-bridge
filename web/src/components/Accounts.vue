@@ -40,6 +40,7 @@ const form = ref({
   refresh_token: '',
   expires_at: '',
   proxy_url: '',
+  gateway_url: '',
   billing_mode: 'strip',
   account_uuid: '',
   organization_uuid: '',
@@ -116,6 +117,7 @@ function openCreate() {
     refresh_token: '',
     expires_at: '',
     proxy_url: '',
+    gateway_url: '',
     billing_mode: 'strip',
     account_uuid: '',
     organization_uuid: '',
@@ -142,6 +144,7 @@ function openEdit(a: Account) {
     refresh_token: '',
     expires_at: a.expires_at ? String(a.expires_at) : '',
     proxy_url: a.proxy_url,
+    gateway_url: a.gateway_url || '',
     billing_mode: a.billing_mode || 'strip',
     account_uuid: a.account_uuid || '',
     organization_uuid: a.organization_uuid || '',
@@ -177,6 +180,7 @@ async function save() {
       if (form.value.refresh_token) updates.refresh_token = form.value.refresh_token;
       if (expiresAt) updates.expires_at = Number(expiresAt);
       updates.proxy_url = form.value.proxy_url;
+      updates.gateway_url = form.value.gateway_url;
       updates.billing_mode = form.value.billing_mode;
       updates.account_uuid = form.value.account_uuid || null;
       updates.organization_uuid = form.value.organization_uuid || null;
@@ -200,6 +204,7 @@ async function save() {
         access_token: form.value.access_token,
         refresh_token: form.value.refresh_token,
         proxy_url: form.value.proxy_url,
+        gateway_url: form.value.gateway_url,
         billing_mode: form.value.billing_mode,
         account_uuid: form.value.account_uuid || null,
         organization_uuid: form.value.organization_uuid || null,
@@ -476,6 +481,7 @@ function applyOAuthResult() {
     refresh_token: isSetupToken ? '' : (r.refresh_token || ''),
     expires_at: (!isSetupToken && r.expires_at) ? String(r.expires_at * 1000) : '',
     proxy_url: oauthProxyUrl.value || '',
+    gateway_url: '',
     billing_mode: 'strip',
     account_uuid: r.account_uuid || '',
     organization_uuid: r.organization_uuid || '',
@@ -591,6 +597,10 @@ async function copyText(text: string) {
               </div>
             </div>
             <div class="space-y-3">
+              <div>
+                <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">Gateway</p>
+                <p class="text-sm text-[#8c8475] truncate">{{ a.gateway_url || 'api.anthropic.com' }}</p>
+              </div>
               <div>
                 <p class="text-[10px] text-[#b5b0a6] uppercase tracking-wider mb-0.5">代理</p>
                 <p class="text-sm text-[#8c8475] truncate">{{ a.proxy_url || '直连' }}</p>
@@ -929,6 +939,14 @@ async function copyText(text: string) {
             <Input
               v-model="form.proxy_url"
               placeholder="http:// 或 socks5://"
+              class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+            />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">Gateway URL（选填）</Label>
+            <Input
+              v-model="form.gateway_url"
+              placeholder="https://api.anthropic.com（留空则使用默认）"
               class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
             />
           </div>

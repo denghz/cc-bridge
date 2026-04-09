@@ -15,7 +15,7 @@ use crate::service::rewriter::{
 };
 use crate::service::telemetry::TelemetryService;
 
-const UPSTREAM_BASE: &str = "https://api.anthropic.com";
+pub const DEFAULT_UPSTREAM_BASE: &str = "https://api.anthropic.com";
 
 pub struct GatewayService {
     account_svc: Arc<AccountService>,
@@ -235,36 +235,41 @@ impl GatewayService {
         body: &[u8],
         account: &Account,
     ) -> Result<Response, AppError> {
-        let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
-        if !query.is_empty() {
-            let q = if query.contains("beta=true") {
-                query.to_string()
-            } else {
-                format!("{}&beta=true", query)
-            };
-            target_url = format!("{}?{}", target_url, q);
+        let (request_url, upstream_url, use_gateway) =
+            build_forward_urls(path, query, &account.gateway_url);
+
+        debug!("upstream URL: {} (via {})", upstream_url,
+            if use_gateway { &account.gateway_url } else { "direct" });
+
+        let client = if use_gateway {
+            // Gateway is typically plain HTTP, no TLS fingerprint needed.
+            crate::tlsfp::make_request_client(&account.proxy_url)
         } else {
-            target_url = format!("{}?beta=true", target_url);
-        }
-
-        debug!("upstream URL: {}", target_url);
-
-        let client = crate::tlsfp::make_request_client(&account.proxy_url);
+            crate::tlsfp::make_request_client(&account.proxy_url)
+        };
 
         let mut req_builder = match method {
-            "GET" => client.get(&target_url),
-            "POST" => client.post(&target_url),
-            "PUT" => client.put(&target_url),
-            "DELETE" => client.delete(&target_url),
-            "PATCH" => client.patch(&target_url),
-            _ => client.post(&target_url),
+            "GET" => client.get(&request_url),
+            "POST" => client.post(&request_url),
+            "PUT" => client.put(&request_url),
+            "DELETE" => client.delete(&request_url),
+            "PATCH" => client.patch(&request_url),
+            _ => client.post(&request_url),
         };
 
         for (k, v) in headers {
             debug!("upstream header: {}: {}", k, v);
             req_builder = req_builder.header(k, v);
         }
-        req_builder = req_builder.header("Host", "api.anthropic.com");
+
+        if use_gateway {
+            // Middleman protocol: tell the gateway where to forward the request.
+            // Do NOT set Host to api.anthropic.com — let reqwest derive it from
+            // the gateway URL so the middleman can route correctly.
+            req_builder = req_builder.header("x-proxy-target-url", &upstream_url);
+        } else {
+            req_builder = req_builder.header("Host", "api.anthropic.com");
+        }
         req_builder = req_builder.body(body.to_vec());
 
         let resp = req_builder
@@ -365,6 +370,40 @@ fn is_gateway_fingerprint_header(name: &str) -> bool {
     GATEWAY_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
+/// Pure routing logic: compute the actual HTTP request URL, the canonical
+/// upstream URL (always api.anthropic.com), and whether the gateway protocol
+/// is active.
+///
+/// When `gateway_url` is empty the request goes directly to
+/// `api.anthropic.com` (legacy behaviour).  When set, the request is sent to
+/// the gateway and `x-proxy-target-url` must be added by the caller.
+fn build_forward_urls(path: &str, query: &str, gateway_url: &str) -> (String, String, bool) {
+    let mut upstream_url = format!("{}{}", DEFAULT_UPSTREAM_BASE, path);
+    if !query.is_empty() {
+        let q = if query.contains("beta=true") {
+            query.to_string()
+        } else {
+            format!("{}&beta=true", query)
+        };
+        upstream_url = format!("{}?{}", upstream_url, q);
+    } else {
+        upstream_url = format!("{}?beta=true", upstream_url);
+    }
+
+    let use_gateway = !gateway_url.is_empty();
+    let request_url = if use_gateway {
+        let gw = gateway_url.trim_end_matches('/');
+        let path_and_query = upstream_url
+            .strip_prefix(DEFAULT_UPSTREAM_BASE)
+            .unwrap_or(&upstream_url);
+        format!("{}{}", gw, path_and_query)
+    } else {
+        upstream_url.clone()
+    };
+
+    (request_url, upstream_url, use_gateway)
+}
+
 fn truncate_body(b: &[u8], max: usize) -> String {
     if b.len() > max {
         format!(
@@ -373,5 +412,117 @@ fn truncate_body(b: &[u8], max: usize) -> String {
         )
     } else {
         String::from_utf8_lossy(b).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // build_forward_urls — empty gateway_url (legacy direct mode)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_gateway_url_simple_path() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/v1/messages", "", "");
+        assert_eq!(req_url, "https://api.anthropic.com/v1/messages?beta=true");
+        assert_eq!(upstream_url, req_url, "request_url must equal upstream_url in direct mode");
+        assert!(!use_gw, "use_gateway must be false when gateway_url is empty");
+    }
+
+    #[test]
+    fn empty_gateway_url_with_query() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/v1/messages", "stream=true", "");
+        assert_eq!(req_url, "https://api.anthropic.com/v1/messages?stream=true&beta=true");
+        assert_eq!(upstream_url, req_url);
+        assert!(!use_gw);
+    }
+
+    #[test]
+    fn empty_gateway_url_query_already_has_beta() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/v1/messages", "beta=true&stream=true", "");
+        assert_eq!(req_url, "https://api.anthropic.com/v1/messages?beta=true&stream=true");
+        assert_eq!(upstream_url, req_url);
+        assert!(!use_gw);
+    }
+
+    #[test]
+    fn empty_gateway_url_no_proxy_target_header() {
+        // When use_gateway is false the caller must NOT add x-proxy-target-url.
+        // This test documents that invariant via the boolean flag.
+        let (_, _, use_gw) = build_forward_urls("/v1/messages", "", "");
+        assert!(!use_gw);
+    }
+
+    #[test]
+    fn empty_gateway_url_host_header_is_anthropic() {
+        // When use_gateway is false, forward_request sets Host to api.anthropic.com.
+        // We verify the flag so the caller knows to set the Host header.
+        let (_, _, use_gw) = build_forward_urls("/v1/messages", "", "");
+        assert!(!use_gw, "direct mode: caller should set Host: api.anthropic.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_forward_urls — with gateway_url (middleman mode)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gateway_url_rewrites_request_url() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/v1/messages", "", "http://gw.example.com");
+        assert_eq!(req_url, "http://gw.example.com/v1/messages?beta=true");
+        assert_eq!(upstream_url, "https://api.anthropic.com/v1/messages?beta=true");
+        assert!(use_gw);
+    }
+
+    #[test]
+    fn gateway_url_with_query() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/v1/messages", "stream=true", "http://gw.example.com");
+        assert_eq!(req_url, "http://gw.example.com/v1/messages?stream=true&beta=true");
+        assert_eq!(upstream_url, "https://api.anthropic.com/v1/messages?stream=true&beta=true");
+        assert!(use_gw);
+    }
+
+    #[test]
+    fn gateway_url_trailing_slash_stripped() {
+        let (req_url, _, _) =
+            build_forward_urls("/v1/messages", "", "http://gw.example.com/");
+        assert_eq!(req_url, "http://gw.example.com/v1/messages?beta=true");
+    }
+
+    #[test]
+    fn gateway_url_preserves_upstream_for_header() {
+        // The upstream_url must always be the canonical api.anthropic.com URL
+        // so it can be sent as x-proxy-target-url.
+        let (_, upstream_url, _) =
+            build_forward_urls("/v1/messages", "foo=bar", "http://proxy:8080");
+        assert!(upstream_url.starts_with("https://api.anthropic.com/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: various paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_gateway_oauth_profile_path() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/api/oauth/profile", "", "");
+        assert_eq!(req_url, "https://api.anthropic.com/api/oauth/profile?beta=true");
+        assert_eq!(upstream_url, req_url);
+        assert!(!use_gw);
+    }
+
+    #[test]
+    fn empty_gateway_telemetry_path() {
+        let (req_url, upstream_url, use_gw) =
+            build_forward_urls("/api/event_logging/batch", "", "");
+        assert_eq!(req_url, "https://api.anthropic.com/api/event_logging/batch?beta=true");
+        assert_eq!(upstream_url, req_url);
+        assert!(!use_gw);
     }
 }

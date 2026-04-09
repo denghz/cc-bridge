@@ -155,6 +155,10 @@ pub struct Account {
     pub auth_error: String,
     #[serde(default)]
     pub proxy_url: String,
+    /// Upstream gateway URL override (e.g. `https://api.anthropic.com`).
+    /// When non-empty, forwarded requests use this base instead of the default.
+    #[serde(default)]
+    pub gateway_url: String,
     pub device_id: String,
     pub canonical_env: Value,
     #[serde(rename = "canonical_prompt_env")]

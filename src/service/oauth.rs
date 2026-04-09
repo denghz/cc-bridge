@@ -39,7 +39,12 @@ impl TokenTester {
     }
 
     /// 通过发送最小消息请求验证 Setup Token 有效性。
-    pub async fn test_token(&self, token: &str, proxy_url: &str) -> Result<(), AppError> {
+    /// When `gateway_url` is non-empty, the request is sent to the middleman
+    /// gateway with `x-proxy-target-url` pointing to the real upstream.
+    pub async fn test_token(&self, token: &str, proxy_url: &str, gateway_url: &str) -> Result<(), AppError> {
+        let (request_url, upstream_url, use_gateway) =
+            build_gateway_url("/v1/messages?beta=true", gateway_url);
+
         let body = serde_json::json!({
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1,
@@ -48,14 +53,18 @@ impl TokenTester {
 
         let client = make_request_client(proxy_url);
 
-        let resp = client
-            .post("https://api.anthropic.com/v1/messages?beta=true")
+        let mut req = client
+            .post(&request_url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "oauth-2025-04-20")
             .header("User-Agent", "claude-cli/2.1.89 (external, cli)")
-            .header("x-app", "cli")
+            .header("x-app", "cli");
+        if use_gateway {
+            req = req.header("x-proxy-target-url", upstream_url);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -128,11 +137,19 @@ pub async fn refresh_oauth_token(
 }
 
 /// 从 Anthropic OAuth API 获取账号用量数据。
-pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError> {
+/// When `gateway_url` is non-empty, the request is sent to the middleman
+/// gateway with `x-proxy-target-url` pointing to the real upstream.
+pub async fn fetch_usage(token: &str, proxy_url: &str, gateway_url: &str) -> Result<Value, AppError> {
+    let (request_url, upstream_url, use_gateway) =
+        build_gateway_url("/api/oauth/usage", gateway_url);
     let client = make_request_client(proxy_url);
 
-    let resp = client
-        .get("https://api.anthropic.com/api/oauth/usage")
+    let mut req = client
+        .get(&request_url);
+    if use_gateway {
+        req = req.header("x-proxy-target-url", upstream_url);
+    }
+    let resp = req
         .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
@@ -166,4 +183,69 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .await
         .map_err(|e| AppError::Internal(format!("usage parse failed: {}", e)))?;
     Ok(data)
+}
+
+const UPSTREAM_BASE: &str = "https://api.anthropic.com";
+
+/// Compute the HTTP request URL for a given path, optionally going through a
+/// middleman gateway.
+///
+/// Returns `(request_url, upstream_url, use_gateway)`.
+/// - When `gateway_url` is empty: `request_url == upstream_url`, direct mode.
+/// - When set: `request_url` targets the gateway, `upstream_url` is the
+///   canonical Anthropic URL that must be sent in `x-proxy-target-url`.
+fn build_gateway_url(path: &str, gateway_url: &str) -> (String, String, bool) {
+    let upstream_url = format!("{}{}", UPSTREAM_BASE, path);
+    if gateway_url.is_empty() {
+        (upstream_url.clone(), upstream_url, false)
+    } else {
+        let gw = gateway_url.trim_end_matches('/');
+        let request_url = format!("{}{}", gw, path);
+        (request_url, upstream_url, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // build_gateway_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_gateway_url_empty_is_direct() {
+        let (req, upstream, gw) = build_gateway_url("/v1/messages?beta=true", "");
+        assert_eq!(req, "https://api.anthropic.com/v1/messages?beta=true");
+        assert_eq!(upstream, req);
+        assert!(!gw);
+    }
+
+    #[test]
+    fn test_build_gateway_url_empty_usage() {
+        let (req, upstream, gw) = build_gateway_url("/api/oauth/usage", "");
+        assert_eq!(req, "https://api.anthropic.com/api/oauth/usage");
+        assert_eq!(upstream, req);
+        assert!(!gw);
+    }
+
+    #[test]
+    fn test_build_gateway_url_with_gateway() {
+        let (req, upstream, gw) =
+            build_gateway_url("/v1/messages?beta=true", "http://gw.example.com");
+        assert_eq!(req, "http://gw.example.com/v1/messages?beta=true");
+        assert_eq!(
+            upstream,
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        assert!(gw);
+    }
+
+    #[test]
+    fn test_build_gateway_url_trailing_slash_stripped() {
+        let (req, _, gw) =
+            build_gateway_url("/api/oauth/usage", "http://gw.example.com/");
+        assert_eq!(req, "http://gw.example.com/api/oauth/usage");
+        assert!(gw);
+    }
 }
