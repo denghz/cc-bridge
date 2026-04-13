@@ -79,123 +79,105 @@ impl GatewayService {
             (vec![], vec![])
         };
 
-        // 429 自动换号重试循环
-        let mut exclude_ids = blocked_ids.clone();
-        let mut last_resp: Option<Response> = None;
+        const MAX_429_RETRIES: u32 = 10;
+        const RETRY_DELAY_MS: &[u64] = &[1000, 1000, 2000, 2000, 4000, 4000, 8000, 8000, 8000];
 
-        loop {
-            let attempt = exclude_ids.len().saturating_sub(blocked_ids.len());
-            // 选择账号
-            let account = match self
-                .account_svc
-                .select_account(&session_hash, &exclude_ids, &allowed_ids)
-                .await
-            {
-                Ok(a) => a,
-                Err(_) if last_resp.is_some() => {
-                    // 无可用账号但有上一次的 429 响应，返回给客户端
-                    return Ok(last_resp.unwrap());
-                }
-                Err(e) => {
-                    return Err(AppError::ServiceUnavailable(format!(
-                        "no available account: {}",
-                        e
-                    )));
-                }
-            };
+        // 选择账号
+        let account = self
+            .account_svc
+            .select_account(&session_hash, &blocked_ids, &allowed_ids)
+            .await
+            .map_err(|e| {
+                AppError::ServiceUnavailable(format!("no available account: {}", e))
+            })?;
 
-            if attempt > 0 {
-                warn!(
-                    "429 retry attempt {} with account {}",
-                    attempt, account.id
-                );
+        // 自动遥测：拦截遥测请求 + 激活会话
+        if account.auto_telemetry {
+            use crate::service::telemetry::{is_telemetry_path, fake_metrics_enabled_response, fake_telemetry_response};
+
+            if is_telemetry_path(&path) {
+                let body = if path.contains("/metrics_enabled") {
+                    fake_metrics_enabled_response()
+                } else {
+                    fake_telemetry_response()
+                };
+                debug!("telemetry: intercepted {} for account {}", path, account.id);
+                return Ok(axum::Json(body).into_response());
             }
 
-            // 自动遥测：拦截遥测请求 + 激活会话
-            if account.auto_telemetry {
-                use crate::service::telemetry::{is_telemetry_path, fake_metrics_enabled_response, fake_telemetry_response};
-
-                if is_telemetry_path(&path) {
-                    let body = if path.contains("/metrics_enabled") {
-                        fake_metrics_enabled_response()
-                    } else {
-                        fake_telemetry_response()
-                    };
-                    debug!("telemetry: intercepted {} for account {}", path, account.id);
-                    return Ok(axum::Json(body).into_response());
-                }
-
-                if path.starts_with("/v1/messages") {
-                    self.telemetry_svc.activate_session(&account).await;
-                }
+            if path.starts_with("/v1/messages") {
+                self.telemetry_svc.activate_session(&account).await;
             }
+        }
 
-            // 获取并发槽位
-            let acquired = self
-                .account_svc
-                .acquire_slot(account.id, account.concurrency)
-                .await
-                .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
-            if !acquired {
-                return Err(AppError::TooManyRequests("concurrency slot unavailable".into()));
-            }
+        // 获取并发槽位
+        let acquired = self
+            .account_svc
+            .acquire_slot(account.id, account.concurrency)
+            .await
+            .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
+        if !acquired {
+            return Err(AppError::TooManyRequests("concurrency slot unavailable".into()));
+        }
 
-            // 确保在函数结束后释放槽位
-            let account_svc = self.account_svc.clone();
-            let account_id_for_release = account.id;
-            let _guard = scopeguard::guard((), move |_| {
-                let svc = account_svc.clone();
-                tokio::spawn(async move {
-                    svc.release_slot(account_id_for_release).await;
-                });
+        // 确保在函数结束后释放槽位
+        let account_svc = self.account_svc.clone();
+        let account_id_for_release = account.id;
+        let _guard = scopeguard::guard((), move |_| {
+            let svc = account_svc.clone();
+            tokio::spawn(async move {
+                svc.release_slot(account_id_for_release).await;
             });
+        });
 
-            // 改写请求体
-            debug!(
-                "request body BEFORE rewrite: {}",
-                truncate_body(&body_bytes, 4096)
-            );
-            let rewritten_body =
-                self.rewriter
-                    .rewrite_body(&body_bytes, &path, &account, client_type);
-            debug!(
-                "request body AFTER rewrite: {}",
-                truncate_body(&rewritten_body, 4096)
-            );
+        // 改写请求体
+        debug!(
+            "request body BEFORE rewrite: {}",
+            truncate_body(&body_bytes, 4096)
+        );
+        let rewritten_body =
+            self.rewriter
+                .rewrite_body(&body_bytes, &path, &account, client_type);
+        debug!(
+            "request body AFTER rewrite: {}",
+            truncate_body(&rewritten_body, 4096)
+        );
 
-            // 重新解析改写后的 body
-            let mut rewritten_body_map: serde_json::Value =
-                serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
+        // 重新解析改写后的 body
+        let mut rewritten_body_map: serde_json::Value =
+            serde_json::from_slice(&rewritten_body).unwrap_or(serde_json::json!({}));
 
-            // 改写 header
-            let model_id = body_map
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
-            let rewritten_headers = self.rewriter.rewrite_headers(
-                &headers,
-                &account,
-                client_type,
-                model_id,
-                &rewritten_body_map,
-            );
+        // 改写 header
+        let model_id = body_map
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        let rewritten_headers = self.rewriter.rewrite_headers(
+            &headers,
+            &account,
+            client_type,
+            model_id,
+            &rewritten_body_map,
+        );
 
-            // 清理 body 中的 _session_id 标记并重新序列化
-            let final_body = if client_type == ClientType::API {
-                clean_session_id_from_body(&mut rewritten_body_map);
-                serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
-            } else {
-                rewritten_body.clone()
-            };
+        // 清理 body 中的 _session_id 标记并重新序列化
+        let final_body = if client_type == ClientType::API {
+            clean_session_id_from_body(&mut rewritten_body_map);
+            serde_json::to_vec(&rewritten_body_map).unwrap_or_else(|_| rewritten_body.clone())
+        } else {
+            rewritten_body.clone()
+        };
 
-            let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
-            let mut final_headers = rewritten_headers;
-            final_headers.insert(
-                "authorization".into(),
-                format!("Bearer {}", upstream_token),
-            );
+        let upstream_token = self.account_svc.resolve_upstream_token(account.id).await?;
+        let mut final_headers = rewritten_headers;
+        final_headers.insert(
+            "authorization".into(),
+            format!("Bearer {}", upstream_token),
+        );
 
-            // 转发到上游
+        // 429 同账号重试循环
+        let mut last_resp: Option<Response> = None;
+        for attempt in 0..=MAX_429_RETRIES {
             let resp = self
                 .forward_request(
                     &method.to_string(),
@@ -207,23 +189,37 @@ impl GatewayService {
                 )
                 .await?;
 
-            // 非 429 直接返回
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 return Ok(resp);
             }
 
-            // 429：排除该账号，尝试下一个
+            // 最后一次重试仍然 429，不再等待
+            if attempt == MAX_429_RETRIES {
+                warn!(
+                    "account {} returned 429 after {} retries, returning to client",
+                    account.id, MAX_429_RETRIES
+                );
+                last_resp = Some(resp);
+                break;
+            }
+
+            let delay = RETRY_DELAY_MS.get(attempt as usize).copied().unwrap_or(4000);
             warn!(
-                "account {} returned 429, excluding and retrying (attempt {})",
-                account.id,
-                attempt + 1,
+                "account {} returned 429, retrying in {}ms (attempt {}/{})",
+                account.id, delay, attempt + 1, MAX_429_RETRIES
             );
-            exclude_ids.push(account.id);
-            // 取消 scopeguard 并手动释放槽位，避免重复释放
-            std::mem::forget(_guard);
-            self.account_svc.release_slot(account.id).await;
-            last_resp = Some(resp);
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
         }
+
+        // 处理限速
+        if let Err(e) = self.account_svc.handle_rate_limit(&account).await {
+            warn!(
+                "failed to handle rate limit for account {}: {}",
+                account.id, e
+            );
+        }
+
+        Ok(last_resp.unwrap())
     }
 
     async fn forward_request(
@@ -282,18 +278,6 @@ impl GatewayService {
 
         let status_code = resp.status().as_u16();
         debug!("upstream response: {}", status_code);
-
-        // 处理限速：429 根据账号类型分别处理
-        // - SetupToken: 保守 5h 限流
-        // - OAuth: 查用量判断是撞墙（5h / 7d）还是纯 rate limit，分别设置限流时长
-        if status_code == 429 {
-            if let Err(e) = self.account_svc.handle_rate_limit(account).await {
-                warn!(
-                    "failed to handle rate limit for account {}: {}",
-                    account.id, e
-                );
-            }
-        }
 
         // 处理认证失败：403 永久停用（但如果账号已处于 429 限流中则跳过，避免误判）
         if status_code == 403 {
